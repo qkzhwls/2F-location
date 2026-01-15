@@ -2,7 +2,7 @@ import pandas as pd
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext
 import os
-import xlwt
+import xlwt 
 from datetime import datetime
 import ctypes
 import warnings
@@ -49,9 +49,6 @@ def is_excluded_opt(text):
     if "2층" in str(text): return True
     return False
 
-def is_product_name(text):
-    return False
-
 def log(msg):
     timestamp = datetime.now().strftime("[%H:%M:%S] ")
     try:
@@ -60,9 +57,18 @@ def log(msg):
     except:
         print(timestamp + str(msg))
 
-def save_as_xls(dataframe, output_path, sheet_name="Sheet1"):
+def save_as_xls_direct(dataframe, output_path, sheet_name="Sheet1"):
     try:
-        dataframe.to_excel(output_path, index=False, sheet_name=sheet_name, engine='xlwt')
+        wb = xlwt.Workbook(encoding='utf-8')
+        ws = wb.add_sheet(sheet_name)
+        headers = dataframe.columns.tolist()
+        for col_idx, header in enumerate(headers):
+            ws.write(0, col_idx, str(header))
+        for row_idx, row in enumerate(dataframe.values):
+            for col_idx, val in enumerate(row):
+                val_str = str(val) if not pd.isna(val) else ""
+                ws.write(row_idx + 1, col_idx, val_str)
+        wb.save(output_path)
         return True
     except Exception as e:
         log(f"[저장 오류] {e}")
@@ -80,13 +86,11 @@ def load_excel_or_csv(file_path, sheet_name=0, header=0):
             try:
                 try: df = pd.read_csv(file_path, encoding=enc, header=header)
                 except: df = pd.read_csv(file_path, encoding=enc, header=header, skiprows=1)
-                
                 df_str = df.head(5).to_string()
                 if "전표" in df_str or "상품" in df_str or "Code" in df_str:
                     log(f"-> CSV 읽기 성공 ({enc})")
                     break
             except: continue
-            
     if df is None:
         try:
             if ext == '.xls':
@@ -106,7 +110,7 @@ def load_excel_or_csv(file_path, sheet_name=0, header=0):
     return df
 
 # ==========================================
-# 2. 로직 (줄단위 추적 + 정렬제거 + 전체보존)
+# 2. 로직 (실사전표 기준 + 표지판 제외 / v28.0)
 # ==========================================
 
 def find_header_row_index(df, keywords):
@@ -149,7 +153,7 @@ def prepare_inbound_df(file_path):
         
     if final_df is not None:
         count = len(final_df)
-        log(f"-> [확인] 입고전표에서 총 {count}개의 데이터를 가져왔습니다.")
+        log(f"-> [확인] 입고전표 데이터 로드 완료 ({count}행)")
         
     return final_df
 
@@ -157,33 +161,28 @@ def get_inbound_mapping(df_in):
     cfg = CONFIG["INBOUND"]
     idx_code = find_col_index_by_name(df_in, cfg["CODE_HEADERS"])
     idx_opt = find_col_index_by_name(df_in, cfg["OPTION_HEADERS"])
-    
-    if idx_code == -1: 
-        log(f"경고: '{cfg['CODE_HEADERS'][0]}' 열을 못 찾아 A열을 사용합니다.")
-        idx_code = 0
-        
-    if idx_opt == -1:
-        log(f"경고: '{cfg['OPTION_HEADERS'][0]}' 열을 못 찾았습니다.")
-        if df_in.shape[1] >= 3: idx_opt = 2; log("-> C열 사용")
-        else: idx_opt = 1; log("-> B열 사용")
-    else:
-        log(f"매핑 완료: 코드[{idx_code}], 옵션[{idx_opt}]")
-        
+    if idx_code == -1: idx_code = 0
+    if idx_opt == -1: idx_opt = 1 if df_in.shape[1] < 3 else 2
     return idx_code, idx_opt
 
-# [1. 당일입고]
-def logic_daily_inbound(p_in, p_audit_list):
-    log("=== [1. 당일입고] 시작 (v24.0) ===")
-    try: df_in = prepare_inbound_df(p_in)
-    except Exception as e: log(f"오류: {e}"); return pd.DataFrame()
+def build_inbound_dict(df_in):
+    """입고전표를 딕셔너리로 변환 {상품코드: 기존옵션}"""
+    idx_code, idx_opt = get_inbound_mapping(df_in)
+    inbound_dict = {}
+    for i in range(len(df_in)):
+        k = normalize_token(df_in.iloc[i, idx_code])
+        v = normalize_token(df_in.iloc[i, idx_opt])
+        if k: inbound_dict[k] = v
+    return inbound_dict
 
-    idx_code_in, idx_opt_in = get_inbound_mapping(df_in)
-    dict_code_opt = {}
+def scan_audit_files_robust(p_audit_list):
+    """실사전표를 스캔하여 {상품코드: 스캔된_위치값(콤마로누적)} 형태의 딕셔너리 반환"""
+    dict_scanned = {}
     audit_cfg = CONFIG["AUDIT"]
-    
+
     for p_audit in p_audit_list:
-        try: df_audit = load_excel_or_csv(p_audit, sheet_name="당일입고실사전표", header=None)
-        except: df_audit = load_excel_or_csv(p_audit, sheet_name=0, header=None)
+        try: df_audit = load_excel_or_csv(p_audit, sheet_name=0, header=None)
+        except: continue
         
         col_idx_anchor = 0
         for r in range(min(20, len(df_audit))):
@@ -201,74 +200,80 @@ def logic_daily_inbound(p_in, p_audit_list):
                     if audit_cfg["ANCHOR_TEXT"] in next_val: break
                     e += 1
                 
+                # 블록 내 순차 스캔
                 current_opt = ""
                 for j in range(s, e):
                     if j >= max_row: break
                     row_data = df_audit.iloc[j]
+                    
+                    # 1. 위치 갱신 확인 (이 줄은 표지판인가?)
+                    is_location_header = False
                     idx_target = find_value_in_row(row_data, audit_cfg["TARGET_TEXT"])
                     if idx_target != -1:
+                        is_location_header = True # 표지판 행으로 표시
                         found_opt = get_safe_value(df_audit, j, idx_target + audit_cfg["OPTION_OFFSET"])
                         if not is_excluded_opt(found_opt):
                             current_opt = found_opt
                     
-                    if current_opt:
+                    # 2. 상품 적용 (표지판 행은 절대 상품으로 추가하지 않음)
+                    if current_opt and not is_location_header:
                         p = get_safe_value(df_audit, j, col_idx_anchor + audit_cfg["CODE_OFFSET"])
-                        if p and "2층" not in p:
-                            if p in dict_code_opt:
-                                current_opts = dict_code_opt[p].split(',')
+                        if p:
+                            if p in dict_scanned:
+                                current_opts = dict_scanned[p].split(',')
                                 if current_opt not in current_opts:
-                                    dict_code_opt[p] += "," + current_opt
+                                    dict_scanned[p] += "," + current_opt
                             else:
-                                dict_code_opt[p] = current_opt
+                                dict_scanned[p] = current_opt
                 i = e
             else: i += 1
+    return dict_scanned
+
+# [1. 당일입고] (실사전표 기준)
+def logic_daily_inbound(p_in, p_audit_list):
+    log("=== [1. 당일입고] 시작 (v28.0: 표지판제외) ===")
+    try: df_in = prepare_inbound_df(p_in)
+    except: return pd.DataFrame()
+    
+    inbound_dict = build_inbound_dict(df_in)
+    scanned_data = scan_audit_files_robust(p_audit_list)
+    log(f"-> 실사전표에서 {len(scanned_data)}개의 상품을 확인했습니다.")
 
     results = []
-    cnt = 0
-    for row_idx in range(len(df_in)):
-        p = normalize_token(df_in.iloc[row_idx, idx_code_in])
-        orig = normalize_token(df_in.iloc[row_idx, idx_opt_in])
+    for code, scanned_loc in scanned_data.items():
+        orig = inbound_dict.get(code, "")
         
         new_v = orig
-        if p in dict_code_opt:
-            adds = dict_code_opt[p].split(',')
-            for a in adds:
-                a = a.strip()
-                if a and not is_excluded_opt(a):
-                    toks = [x.strip() for x in new_v.split(',')]
-                    if a not in toks: 
-                        new_v = (new_v + "," + a) if new_v else a
+        adds = scanned_loc.split(',')
+        for a in adds:
+            a = a.strip()
+            if a:
+                toks = [x.strip() for x in new_v.split(',')]
+                if a not in toks:
+                    new_v = (new_v + "," + a) if new_v else a
         
         results.append({
-            CONFIG["INBOUND"]["CODE_HEADERS"][0]: p, 
+            CONFIG["INBOUND"]["CODE_HEADERS"][0]: code,
             CONFIG["INBOUND"]["OPTION_HEADERS"][0]: new_v.upper()
         })
-        
-        if new_v != orig: cnt += 1
             
-    log(f"완료: 총 {len(results)}개 행 저장 (변경 {cnt}개)")
+    log(f"완료: 총 {len(results)}개 상품 저장")
     return pd.DataFrame(results)
 
-# [2. 자리변경]
+# [2. 자리변경] (실사전표 기준)
 def logic_location_change(p_in, p_audit_list):
-    log("=== [2. 자리변경] 시작 (v24.0) ===")
+    log("=== [2. 자리변경] 시작 (v28.0: 표지판제외) ===")
     try: df_in = prepare_inbound_df(p_in)
     except: return pd.DataFrame()
 
-    idx_code_in, idx_opt_in = get_inbound_mapping(df_in)
-
-    opt_dict = {}
-    for r in range(len(df_in)):
-        p = normalize_token(df_in.iloc[r, idx_code_in])
-        val = normalize_token(df_in.iloc[r, idx_opt_in])
-        if p: opt_dict[p] = val
-
-    all_audit_codes = set(); mod_codes = set()
+    inbound_dict = build_inbound_dict(df_in)
+    
+    mod_results = {}
     audit_cfg = CONFIG["AUDIT"]
 
     for p_audit in p_audit_list:
-        try: df_z = load_excel_or_csv(p_audit, sheet_name="자리변경실사전표", header=None)
-        except: df_z = load_excel_or_csv(p_audit, sheet_name=0, header=None)
+        try: df_z = load_excel_or_csv(p_audit, sheet_name=0, header=None)
+        except: continue
 
         f2_info = [] 
         for i in range(len(df_z)):
@@ -276,13 +281,8 @@ def logic_location_change(p_in, p_audit_list):
             if idx != -1: f2_info.append((i, idx))
         
         if len(f2_info) % 2 != 0: continue
-
         code_col_idx = 2 
         if f2_info: code_col_idx = max(0, f2_info[0][1] - 2)
-
-        for i in range(1, len(df_z)):
-             code_val = get_safe_value(df_z, i, code_col_idx)
-             if code_val: all_audit_codes.add(code_val)
 
         for k in range(0, len(f2_info), 2):
             s_row, s_col = f2_info[k]
@@ -294,173 +294,118 @@ def logic_location_change(p_in, p_audit_list):
             if is_excluded_opt(a_opt): a_opt = ""
             
             for j in range(s_row + 1, e_row):
+                # 2층(표지판)이 아닌 행만 상품으로 취급
                 if find_value_in_row(df_z.iloc[j], audit_cfg["TARGET_TEXT"]) == -1:
                     p = get_safe_value(df_z, j, code_col_idx)
-                    if p in opt_dict:
-                        curr = opt_dict[p]; rep = False
+                    if p:
+                        curr = mod_results.get(p, inbound_dict.get(p, ""))
                         if curr:
                             lst = [x.strip() for x in curr.split(',')]
                             new_l = []
+                            rep = False
                             for t in lst:
-                                if d_opt and t == d_opt: new_l.append(a_opt); rep = True
-                                else: new_l.append(t)
+                                if d_opt and t == d_opt: 
+                                    new_l.append(a_opt)
+                                    rep = True
+                                else: 
+                                    new_l.append(t)
+                            
                             if rep:
                                 clean_l = [x for x in new_l if x]
-                                opt_dict[p] = ",".join(clean_l)
-                                mod_codes.add(p)
-
-    results = [{CONFIG["INBOUND"]["CODE_HEADERS"][0]: k, CONFIG["INBOUND"]["OPTION_HEADERS"][0]: v.upper()} for k, v in opt_dict.items() if k in all_audit_codes and k in mod_codes and v]
-    log(f"완료: {len(results)}개 업데이트됨")
-    return pd.DataFrame(results)
-
-# [3. 재입고]
-def logic_restock(p_in, p_audit_list):
-    log("=== [3. 재입고] 시작 (v24.0) ===")
-    try: df_in = prepare_inbound_df(p_in)
-    except: return pd.DataFrame()
-
-    idx_code_in, idx_opt_in = get_inbound_mapping(df_in)
-
-    rep_dict = {}; filter_dict = set()
-    audit_cfg = CONFIG["AUDIT"]
-
-    for p_audit in p_audit_list:
-        try: df_audit = load_excel_or_csv(p_audit, sheet_name="재입고변경실사전표", header=None)
-        except: df_audit = load_excel_or_csv(p_audit, sheet_name=0, header=None)
-
-        col_idx_anchor = 0
-        for r in range(min(20, len(df_audit))):
-            idx = find_value_in_row(df_audit.iloc[r], audit_cfg["ANCHOR_TEXT"])
-            if idx != -1:
-                col_idx_anchor = idx; break
-
-        blk = False; c_rep = ""
-        
-        for i in range(len(df_audit)):
-            cell_a = clean_text(get_safe_value(df_audit, i, col_idx_anchor))
-            
-            if audit_cfg["ANCHOR_TEXT"] in cell_a:
-                blk = False; c_rep = ""
-            elif get_safe_value(df_audit, i, col_idx_anchor).replace('.','',1).isdigit():
-                p = get_safe_value(df_audit, i, col_idx_anchor + audit_cfg["CODE_OFFSET"]) 
-                
-                if not blk:
-                    c_rep = get_safe_value(df_audit, i, col_idx_anchor + 5)
-                    blk = True
-                
-                if not is_excluded_opt(c_rep) and p and c_rep:
-                    if p in rep_dict: 
-                        if c_rep not in rep_dict[p]:
-                            rep_dict[p].append(c_rep)
-                    else: 
-                        rep_dict[p] = [c_rep]
-                    filter_dict.add(p)
+                                mod_results[p] = ",".join(clean_l)
 
     results = []
-    cnt = 0
-    for row_idx in range(len(df_in)):
-        k = normalize_token(df_in.iloc[row_idx, idx_code_in])
-        v = normalize_token(df_in.iloc[row_idx, idx_opt_in])
+    for code, val in mod_results.items():
+        results.append({
+            CONFIG["INBOUND"]["CODE_HEADERS"][0]: code,
+            CONFIG["INBOUND"]["OPTION_HEADERS"][0]: val.upper()
+        })
         
-        final_val = v
-        if k in filter_dict:
-            new_locs = rep_dict.get(k, [])
-            old_locs = [x.strip() for x in v.split(',') if x.strip()]
-            
-            merged = []
-            seen = set()
-            for loc in new_locs:
-                if loc not in seen and not is_excluded_opt(loc):
-                    merged.append(loc)
-                    seen.add(loc)
-            for loc in old_locs:
-                if loc not in seen and not is_excluded_opt(loc):
-                    merged.append(loc)
-                    seen.add(loc)
-            
-            final_val = ",".join(merged).upper()
-            cnt += 1
-            
-        results.append({CONFIG["INBOUND"]["CODE_HEADERS"][0]: k, CONFIG["INBOUND"]["OPTION_HEADERS"][0]: final_val})
-        
-    log(f"완료: 총 {len(results)}개 행 저장 (재입고 병합 {cnt}개)")
+    log(f"완료: 총 {len(results)}개 상품 변경됨")
     return pd.DataFrame(results)
 
-# [4. 덮어쓰기]
-def logic_overwrite(p_in, p_audit_list):
-    log("=== [4. 덮어쓰기] 시작 (v24.0) ===")
+# [3. 재입고] (실사전표 기준)
+def logic_restock(p_in, p_audit_list):
+    log("=== [3. 재입고] 시작 (v28.0: 표지판제외) ===")
     try: df_in = prepare_inbound_df(p_in)
     except: return pd.DataFrame()
 
-    idx_code_in, idx_opt_in = get_inbound_mapping(df_in)
-    dict_code_opt = {}
+    inbound_dict = build_inbound_dict(df_in)
+    scanned_data = {}
     audit_cfg = CONFIG["AUDIT"]
-    
+
     for p_audit in p_audit_list:
-        try: df_audit = load_excel_or_csv(p_audit, sheet_name="당일입고실사전표", header=None)
-        except: df_audit = load_excel_or_csv(p_audit, sheet_name=0, header=None)
+        try: df_audit = load_excel_or_csv(p_audit, sheet_name=0, header=None)
+        except: continue
 
         col_idx_anchor = 0
         for r in range(min(20, len(df_audit))):
             idx = find_value_in_row(df_audit.iloc[r], audit_cfg["ANCHOR_TEXT"])
             if idx != -1: col_idx_anchor = idx; break
 
-        i = 0; max_row = len(df_audit)
-        while i < max_row:
+        blk = False; c_rep = ""
+        for i in range(len(df_audit)):
             cell_a = clean_text(get_safe_value(df_audit, i, col_idx_anchor))
+            
+            # 2층(표지판) 행은 재입고 로직에서 무시하거나 초기화 용도로만 씀
             if audit_cfg["ANCHOR_TEXT"] in cell_a:
-                s = i + 2; e = s
-                while e < max_row:
-                    if audit_cfg["ANCHOR_TEXT"] in clean_text(get_safe_value(df_audit, e, col_idx_anchor)): break
-                    e += 1
+                blk = False; c_rep = ""
+            elif get_safe_value(df_audit, i, col_idx_anchor).replace('.','',1).isdigit():
+                # 여기서도 2층 키워드가 있는 행인지 체크
+                if find_value_in_row(df_audit.iloc[i], audit_cfg["TARGET_TEXT"]) != -1:
+                    continue # 표지판 행이면 스킵
+
+                p = get_safe_value(df_audit, i, col_idx_anchor + audit_cfg["CODE_OFFSET"]) 
+                if not blk:
+                    c_rep = get_safe_value(df_audit, i, col_idx_anchor + 5)
+                    blk = True
                 
-                current_opt = ""
-                for j in range(s, e):
-                    if j >= max_row: break
-                    row = df_audit.iloc[j]
-                    
-                    idx_2f = find_value_in_row(row, audit_cfg["TARGET_TEXT"])
-                    if idx_2f != -1:
-                        found_opt = get_safe_value(df_audit, j, idx_2f + 1)
-                        if not is_excluded_opt(found_opt):
-                            current_opt = found_opt
-                    
-                    if current_opt:
-                        p = get_safe_value(df_audit, j, col_idx_anchor + audit_cfg["CODE_OFFSET"])
-                        if p and "2층" not in p: 
-                            if p in dict_code_opt:
-                                current_opts = dict_code_opt[p].split(',')
-                                if current_opt not in current_opts:
-                                    dict_code_opt[p] += "," + current_opt
-                            else: dict_code_opt[p] = current_opt
-                i = e
-            else: i += 1
+                if not is_excluded_opt(c_rep) and p and c_rep:
+                    if p in scanned_data:
+                        if c_rep not in scanned_data[p]: scanned_data[p].append(c_rep)
+                    else:
+                        scanned_data[p] = [c_rep]
 
     results = []
-    cnt = 0
-    for row_idx in range(len(df_in)):
-        p = normalize_token(df_in.iloc[row_idx, idx_code_in])
-        orig = normalize_token(df_in.iloc[row_idx, idx_opt_in])
+    for code, new_locs in scanned_data.items():
+        orig_val = inbound_dict.get(code, "")
+        old_locs = [x.strip() for x in orig_val.split(',') if x.strip()]
         
-        new_v = orig
-        if p in dict_code_opt:
-            raw_opts = dict_code_opt[p].split(',')
-            valid_opts = []
-            seen = set()
-            for opt in raw_opts:
-                opt = opt.strip()
-                if opt and not is_excluded_opt(opt) and opt not in seen:
-                    valid_opts.append(opt)
-                    seen.add(opt)
-            
-            final_val = ",".join(valid_opts).upper()
-            if final_val != orig: 
-                new_v = final_val
-                cnt += 1
+        merged = []
+        seen = set()
+        for loc in new_locs:
+            if loc not in seen and not is_excluded_opt(loc):
+                merged.append(loc); seen.add(loc)
+        for loc in old_locs:
+            if loc not in seen and not is_excluded_opt(loc):
+                merged.append(loc); seen.add(loc)
                 
-        results.append({CONFIG["INBOUND"]["CODE_HEADERS"][0]: p, CONFIG["INBOUND"]["OPTION_HEADERS"][0]: new_v})
-        
-    log(f"완료: 총 {len(results)}개 행 저장 (덮어쓰기 {cnt}개)")
+        results.append({
+            CONFIG["INBOUND"]["CODE_HEADERS"][0]: code,
+            CONFIG["INBOUND"]["OPTION_HEADERS"][0]: ",".join(merged).upper()
+        })
+
+    log(f"완료: 총 {len(results)}개 상품 저장")
+    return pd.DataFrame(results)
+
+# [4. 덮어쓰기] (실사전표 기준)
+def logic_overwrite(p_in, p_audit_list):
+    log("=== [4. 덮어쓰기] 시작 (v28.0: 표지판제외) ===")
+    try: df_in = prepare_inbound_df(p_in)
+    except: return pd.DataFrame()
+    
+    # 여기서도 표지판 제외 로직이 적용된 함수 사용
+    scanned_data = scan_audit_files_robust(p_audit_list)
+    log(f"-> 실사전표에서 {len(scanned_data)}개의 상품을 확인했습니다.")
+
+    results = []
+    for code, scanned_loc in scanned_data.items():
+        results.append({
+            CONFIG["INBOUND"]["CODE_HEADERS"][0]: code,
+            CONFIG["INBOUND"]["OPTION_HEADERS"][0]: scanned_loc.upper()
+        })
+            
+    log(f"완료: 총 {len(results)}개 상품 저장")
     return pd.DataFrame(results)
 
 # ==========================================
@@ -470,7 +415,6 @@ def reset_all_files():
     global path_inbound_file, path_audit_files
     path_inbound_file = ""
     path_audit_files = []
-    
     lbl_inbound_path.config(text="선택 안됨")
     lbl_audit_path.config(text="없음")
     log("모든 파일 선택이 초기화되었습니다.")
@@ -491,15 +435,15 @@ def run_btn1():
     try:
         df = logic_daily_inbound(path_inbound_file, path_audit_files)
         if df.empty: 
-            log("결과: 변경된 데이터가 없습니다.")
-            messagebox.showinfo("알림", "변경 없음"); return
+            log("결과: 처리된 데이터가 없습니다.")
+            messagebox.showinfo("알림", "처리된 데이터가 없습니다."); return
         
         save_name = f"입고전표_당일입고변환_{datetime.now().strftime('%Y%m%d')}.xls"
         save_path = os.path.join(os.path.dirname(path_inbound_file), save_name)
-        if save_as_xls(df, save_path, "당일입고변환"):
+        if save_as_xls_direct(df, save_path, "당일입고변환"):
             log(f"저장 완료: {save_name}")
             messagebox.showinfo("완료", "저장되었습니다.")
-            reset_all_files() # [추가] 자동 초기화
+            reset_all_files()
     except Exception as e: 
         log(f"오류 발생: {e}")
         messagebox.showerror("오류", str(e))
@@ -509,14 +453,15 @@ def run_btn2():
     try:
         df = logic_location_change(path_inbound_file, path_audit_files)
         if df.empty: 
-            log("결과: 변경된 데이터가 없습니다.")
-            messagebox.showinfo("알림", "변경 없음"); return
+            log("결과: 변경 대상이 없습니다.")
+            messagebox.showinfo("알림", "변경 대상 없음"); return
+        
         save_name = f"입고전표_자리변경결과_{datetime.now().strftime('%Y%m%d')}.xls"
         save_path = os.path.join(os.path.dirname(path_inbound_file), save_name)
-        if save_as_xls(df, save_path, "자리변경"):
+        if save_as_xls_direct(df, save_path, "자리변경"):
             log(f"저장 완료: {save_name}")
             messagebox.showinfo("완료", "저장되었습니다.")
-            reset_all_files() # [추가] 자동 초기화
+            reset_all_files()
     except Exception as e: 
         log(f"오류 발생: {e}")
         messagebox.showerror("오류", str(e))
@@ -526,14 +471,15 @@ def run_btn3():
     try:
         df = logic_restock(path_inbound_file, path_audit_files)
         if df.empty: 
-            log("결과: 변경된 데이터가 없습니다.")
-            messagebox.showinfo("알림", "변경 없음"); return
+            log("결과: 처리된 데이터가 없습니다.")
+            messagebox.showinfo("알림", "처리된 데이터 없음"); return
+        
         save_name = f"입고전표_재입고변경결과_{datetime.now().strftime('%Y%m%d')}.xls"
         save_path = os.path.join(os.path.dirname(path_inbound_file), save_name)
-        if save_as_xls(df, save_path, "재입고"):
+        if save_as_xls_direct(df, save_path, "재입고"):
             log(f"저장 완료: {save_name}")
             messagebox.showinfo("완료", "저장되었습니다.")
-            reset_all_files() # [추가] 자동 초기화
+            reset_all_files()
     except Exception as e: 
         log(f"오류 발생: {e}")
         messagebox.showerror("오류", str(e))
@@ -543,14 +489,15 @@ def run_btn4_overwrite():
     try:
         df = logic_overwrite(path_inbound_file, path_audit_files)
         if df.empty: 
-            log("결과: 변경된 데이터가 없습니다.")
-            messagebox.showinfo("알림", "변경 없음"); return
+            log("결과: 처리된 데이터가 없습니다.")
+            messagebox.showinfo("알림", "처리된 데이터 없음"); return
+        
         save_name = f"입고전표_삭제변환_{datetime.now().strftime('%Y%m%d')}.xls"
         save_path = os.path.join(os.path.dirname(path_inbound_file), save_name)
-        if save_as_xls(df, save_path, "삭제변환"):
+        if save_as_xls_direct(df, save_path, "삭제변환"):
             log(f"저장 완료: {save_name}")
             messagebox.showinfo("완료", "저장되었습니다.")
-            reset_all_files() # [추가] 자동 초기화
+            reset_all_files()
     except Exception as e: 
         log(f"오류 발생: {e}")
         messagebox.showerror("오류", str(e))
@@ -576,7 +523,7 @@ def add_audit_files():
 
 if __name__ == "__main__":
     root = tk.Tk()
-    root.title("2층 로케이션 지정 프로그램")
+    root.title("전표 변환 v28.0 (표지판 제외)")
     root.geometry("600x650")
 
     frame_files = tk.LabelFrame(root, text="1. 파일 선택", padx=10, pady=10)
@@ -596,15 +543,15 @@ if __name__ == "__main__":
     frame_btns.pack(fill='x', padx=10)
     frame_btns.columnconfigure((0,1), weight=1)
 
-    tk.Button(frame_btns, text="1. 당일입고", command=run_btn1, bg="#e1f5fe", font=("맑은 고딕", 11), height=2).grid(row=0, column=0, sticky="ew", padx=2, pady=2)
-    tk.Button(frame_btns, text="2. 자리변경", command=run_btn2, bg="#fff9c4", font=("맑은 고딕", 11), height=2).grid(row=0, column=1, sticky="ew", padx=2, pady=2)
-    tk.Button(frame_btns, text="3. 재입고", command=run_btn3, bg="#ffebee", font=("맑은 고딕", 11), height=2).grid(row=1, column=0, sticky="ew", padx=2, pady=2)
-    tk.Button(frame_btns, text="4. 로케이션정리", command=run_btn4_overwrite, bg="#e0e0e0", font=("맑은 고딕", 11), height=2).grid(row=1, column=1, sticky="ew", padx=2, pady=2)
+    tk.Button(frame_btns, text="1. 당일입고 (추가)", command=run_btn1, bg="#e1f5fe", font=("맑은 고딕", 11), height=2).grid(row=0, column=0, sticky="ew", padx=2, pady=2)
+    tk.Button(frame_btns, text="2. 자리변경 (교체)", command=run_btn2, bg="#fff9c4", font=("맑은 고딕", 11), height=2).grid(row=0, column=1, sticky="ew", padx=2, pady=2)
+    tk.Button(frame_btns, text="3. 재입고 (병합)", command=run_btn3, bg="#ffebee", font=("맑은 고딕", 11), height=2).grid(row=1, column=0, sticky="ew", padx=2, pady=2)
+    tk.Button(frame_btns, text="4. 삭제/덮어쓰기", command=run_btn4_overwrite, bg="#e0e0e0", font=("맑은 고딕", 11), height=2).grid(row=1, column=1, sticky="ew", padx=2, pady=2)
 
     frame_log = tk.LabelFrame(root, text="진단 로그", padx=5, pady=5)
     frame_log.pack(fill='both', expand=True, padx=10, pady=10)
     txt_log = scrolledtext.ScrolledText(frame_log, height=10)
     txt_log.pack(fill='both', expand=True)
 
-    log("프로그램 준비 완료. v24.0 (자동 초기화)")
+    log("프로그램 준비 완료. v28.0 (표지판 제외)")
     root.mainloop()
